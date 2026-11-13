@@ -1,8 +1,8 @@
 import express from 'express';
 import cors from 'cors';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join, dirname, resolve } from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = join(__dirname, '..', 'data.json');
@@ -305,8 +305,14 @@ app.get('/api', (_req, res) => res.json({
 
 app.use((req, res) => res.status(404).json({ error: 'Route not found', path: req.path }));
 
-if (process.env.NODE_ENV !== 'test') {
-  app.listen(PORT, () => console.log(`DeployMate API running at http://localhost:${PORT}`));
+const isMainModule =
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+
+if (isMainModule) {
+  app.listen(PORT, () => {
+    console.log(`DeployMate API running at http://localhost:${PORT}`);
+  });
 }
 
 export default app;
