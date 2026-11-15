@@ -3,6 +3,7 @@ import cors from 'cors';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join, dirname, resolve } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import AdmZip from 'adm-zip';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = join(__dirname, '..', 'data.json');
@@ -335,6 +336,64 @@ app.get('/api/github/runs/:runId/jobs', async (req, res) => {
   }
 });
 
+// Get and parse GitHub Actions workflow logs
+app.get('/api/github/runs/:runId/logs', async (req, res) => {
+  try {
+    const { token, owner, repo } = getGitHubConfig();
+    const { runId } = req.params;
+
+    if (!/^\d+$/.test(runId)) {
+      return res.status(400).json({
+        error: 'Invalid workflow run ID',
+      });
+    }
+
+    const response = await fetch(
+      `${GITHUB_API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${runId}/logs`,
+      {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${token}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+        redirect: 'follow',
+      }
+    );
+
+    if (!response.ok) {
+      const message = await response.text();
+      throw new Error(
+        `GitHub logs request failed (${response.status}): ${message.slice(0, 300)}`
+      );
+    }
+
+    const archiveBuffer = Buffer.from(await response.arrayBuffer());
+    const zip = new AdmZip(archiveBuffer);
+
+    const files = zip
+      .getEntries()
+      .filter((entry) => !entry.isDirectory)
+      .filter((entry) => entry.entryName.toLowerCase().endsWith('.txt'))
+      .map((entry) => {
+        const content = entry.getData().toString('utf8');
+
+        return {
+          name: entry.entryName,
+          size: Buffer.byteLength(content, 'utf8'),
+          content,
+        };
+      });
+
+    res.json({
+      runId,
+      totalFiles: files.length,
+      files,
+    });
+  } catch (error) {
+    githubError(res, error);
+  }
+});
+
 // Trigger actual GitHub Actions workflow
 app.post('/api/github/dispatch', async (req, res) => {
   try {
@@ -559,6 +618,7 @@ app.get('/api', (_req, res) => res.json({
     '/api/github/status',
     '/api/github/workflows',
     '/api/github/runs',
+    '/api/github/runs/:runId/logs',
     '/api/github/dispatch',
   ],
 }));
