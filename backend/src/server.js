@@ -9,7 +9,15 @@ const DATA_FILE = join(__dirname, '..', 'data.json');
 
 const app = express();
 const PORT = Number(process.env.PORT || 5000);
-app.use(cors());
+
+const allowedOrigins = [
+  'http://localhost:5173',
+  process.env.FRONTEND_URL
+].filter(Boolean);
+
+app.use(cors({
+  origin: allowedOrigins
+}));
 app.use(express.json());
 
 // ─── Persistent data store ───────────────────────────────────────────────────
