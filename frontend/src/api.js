@@ -2,7 +2,6 @@
 
 const BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 
-
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...options.headers },
@@ -46,5 +45,21 @@ export const api = {
   settings: {
     get: () => request('/api/settings'),
     update: (data) => request('/api/settings', { method: 'PUT', body: data }),
+  },
+
+  github: {
+    status: () => request('/api/github/status'),
+    workflows: () => request('/api/github/workflows'),
+    runs: (params = {}) => {
+      const q = new URLSearchParams(params).toString();
+      return request(`/api/github/runs${q ? '?' + q : ''}`);
+    },
+    runDetails: (id) => request(`/api/github/runs/${id}`),
+    jobs: (id) => request(`/api/github/runs/${id}/jobs`),
+    logs: (id) => request(`/api/github/runs/${id}/logs`),
+    dispatch: (data) => request('/api/github/dispatch', {
+      method: 'POST',
+      body: data,
+    }),
   },
 };

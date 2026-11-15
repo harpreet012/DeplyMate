@@ -132,6 +132,247 @@ function addLog(type, message, user, level = 'info', meta = {}) {
   return entry;
 }
 
+// ─── GitHub Actions Integration ──────────────────────────────────────────────
+
+const GITHUB_API = 'https://api.github.com';
+
+function getGitHubConfig() {
+  const { GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO } = process.env;
+
+  if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
+    throw new Error('GitHub configuration is missing on the backend');
+  }
+
+  return {
+    token: GITHUB_TOKEN,
+    owner: GITHUB_OWNER,
+    repo: GITHUB_REPO,
+  };
+}
+
+async function githubRequest(endpoint, options = {}) {
+  const config = getGitHubConfig();
+
+  const response = await fetch(`${GITHUB_API}${endpoint}`, {
+    ...options,
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${config.token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      'Content-Type': 'application/json',
+      ...options.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(
+      error.message || `GitHub API error: ${response.status}`
+    );
+  }
+
+  if (response.status === 204) return null;
+  return response.json();
+}
+
+function githubError(res, error) {
+  console.error('GitHub integration error:', error.message);
+
+  const status = error.message.includes('configuration is missing')
+    ? 503
+    : 502;
+
+  res.status(status).json({
+    error: 'GitHub integration request failed',
+    message: error.message,
+  });
+}
+
+// Connection status
+app.get('/api/github/status', async (_req, res) => {
+  try {
+    const { owner, repo } = getGitHubConfig();
+
+    const repository = await githubRequest(
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
+    );
+
+    res.json({
+      connected: true,
+      repository: repository.full_name,
+      defaultBranch: repository.default_branch,
+      private: repository.private,
+    });
+  } catch (error) {
+    githubError(res, error);
+  }
+});
+
+// List workflows
+app.get('/api/github/workflows', async (_req, res) => {
+  try {
+    const { owner, repo } = getGitHubConfig();
+
+    const data = await githubRequest(
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows`
+    );
+
+    res.json({
+      workflows: data.workflows.map(workflow => ({
+        id: workflow.id,
+        name: workflow.name,
+        path: workflow.path,
+        state: workflow.state,
+        url: workflow.html_url,
+      })),
+      total: data.total_count,
+    });
+  } catch (error) {
+    githubError(res, error);
+  }
+});
+
+// List workflow runs
+app.get('/api/github/runs', async (req, res) => {
+  try {
+    const { owner, repo } = getGitHubConfig();
+    const perPage = Math.min(
+      Math.max(Number(req.query.per_page) || 20, 1),
+      100
+    );
+
+    const params = new URLSearchParams({
+      per_page: String(perPage),
+    });
+
+    if (req.query.branch) params.set('branch', req.query.branch);
+    if (req.query.status) params.set('status', req.query.status);
+
+    const data = await githubRequest(
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs?${params}`
+    );
+
+    const runs = data.workflow_runs.map(run => ({
+      id: run.id,
+      name: run.name,
+      workflowName: run.display_title,
+      runNumber: run.run_number,
+      branch: run.head_branch,
+      commit: run.head_sha,
+      status: run.status,
+      conclusion: run.conclusion,
+      event: run.event,
+      createdAt: run.created_at,
+      updatedAt: run.updated_at,
+      runStartedAt: run.run_started_at,
+      duration:
+        run.run_started_at && run.updated_at
+          ? `${Math.max(
+              0,
+              Math.round(
+                (new Date(run.updated_at) - new Date(run.run_started_at)) / 1000
+              )
+            )}s`
+          : '—',
+      triggeredBy: run.actor?.login || 'Unknown',
+      url: run.html_url,
+      workflowId: run.workflow_id,
+    }));
+
+    res.json({
+      runs,
+      total: data.total_count,
+    });
+  } catch (error) {
+    githubError(res, error);
+  }
+});
+
+// Individual workflow run
+app.get('/api/github/runs/:runId', async (req, res) => {
+  try {
+    const { owner, repo } = getGitHubConfig();
+
+    const run = await githubRequest(
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${req.params.runId}`
+    );
+
+    res.json(run);
+  } catch (error) {
+    githubError(res, error);
+  }
+});
+
+// Jobs for a workflow run
+app.get('/api/github/runs/:runId/jobs', async (req, res) => {
+  try {
+    const { owner, repo } = getGitHubConfig();
+
+    const data = await githubRequest(
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${req.params.runId}/jobs?per_page=100`
+    );
+
+    res.json({
+      jobs: data.jobs.map(job => ({
+        id: job.id,
+        name: job.name,
+        status: job.status,
+        conclusion: job.conclusion,
+        startedAt: job.started_at,
+        completedAt: job.completed_at,
+        steps: job.steps?.map(step => ({
+          name: step.name,
+          status: step.status,
+          conclusion: step.conclusion,
+          number: step.number,
+        })) || [],
+        url: job.html_url,
+      })),
+      total: data.total_count,
+    });
+  } catch (error) {
+    githubError(res, error);
+  }
+});
+
+// Trigger actual GitHub Actions workflow
+app.post('/api/github/dispatch', async (req, res) => {
+  try {
+    const { owner, repo } = getGitHubConfig();
+    const branch = String(req.body.branch || 'main').trim();
+
+    if (!branch || branch.length > 255) {
+      return res.status(400).json({
+        error: 'A valid branch name is required',
+      });
+    }
+
+    await githubRequest(
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows/ci-cd.yml/dispatches`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ref: branch }),
+      }
+    );
+
+    addLog(
+      'pipeline',
+      `GitHub Actions workflow dispatched on branch ${branch}`,
+      'admin@deploymate.dev',
+      'info',
+      { branch, source: 'github-actions' }
+    );
+
+    res.status(202).json({
+      success: true,
+      message: 'GitHub Actions workflow dispatched successfully',
+      branch,
+    });
+  } catch (error) {
+    githubError(res, error);
+  }
+});
+
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => {
   res.json({
@@ -308,7 +549,18 @@ app.patch('/api/settings', (req, res) => {
 app.get('/api', (_req, res) => res.json({
   name: 'DeployMate API',
   version: '1.0.0',
-  endpoints: ['/api/health', '/api/metrics', '/api/deployments', '/api/pipelines', '/api/activity', '/api/settings'],
+  endpoints: [
+    '/api/health',
+    '/api/metrics',
+    '/api/deployments',
+    '/api/pipelines',
+    '/api/activity',
+    '/api/settings',
+    '/api/github/status',
+    '/api/github/workflows',
+    '/api/github/runs',
+    '/api/github/dispatch',
+  ],
 }));
 
 app.use((req, res) => res.status(404).json({ error: 'Route not found', path: req.path }));
