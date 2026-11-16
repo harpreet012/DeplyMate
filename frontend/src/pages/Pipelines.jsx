@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Check,
   X,
@@ -37,6 +37,87 @@ function normalizeRun(run) {
   }
 
   return { ...run, status };
+}
+
+function analyzeFailure(logFiles, jobs = []) {
+  const allLines = logFiles.flatMap((file) =>
+    (file.content || '')
+      .split(/\r?\n/)
+      .map((line) => ({ line: line.trim(), file: file.name }))
+      .filter((entry) => entry.line)
+  );
+
+  const patterns = [
+    {
+      category: 'Dependency Error',
+      test: /npm ERR!|ERESOLVE|unable to resolve dependency|module not found|cannot find package|no matching version/i,
+      cause: 'A required package or dependency could not be resolved or loaded.',
+      fix: 'Check package.json and package-lock.json, verify package versions, then run npm install and retry the build.',
+    },
+    {
+      category: 'Test Failure',
+      test: /AssertionError|tests? failed|test suite failed|FAIL\s|failing tests?|expected .* to (equal|be)|not ok \d+/i,
+      cause: 'One or more automated tests did not pass.',
+      fix: 'Inspect the failed test output, correct the application logic or test expectation, and rerun the test suite.',
+    },
+    {
+      category: 'Docker Build Error',
+      test: /docker build failed|failed to solve|failed to compute cache key|dockerfile parse error|error response from daemon|no such file or directory.*docker/i,
+      cause: 'Docker could not complete an image build or resolve a required build input.',
+      fix: 'Review the Dockerfile, build context, COPY paths, base image and Docker build output.',
+    },
+    {
+      category: 'Authentication / Permission Error',
+      test: /authentication failed|bad credentials|unauthorized|permission denied|resource not accessible by integration|403 forbidden|401 unauthorized/i,
+      cause: 'A credential, token, or permission required by the workflow may be missing or insufficient.',
+      fix: 'Verify the relevant GitHub Actions secrets, token permissions and repository access. Never print tokens in logs.',
+    },
+    {
+      category: 'Build / Compilation Error',
+      test: /build failed|compilation failed|failed to compile|syntaxerror|typeerror|vite.*error|error during build/i,
+      cause: 'The application build or compilation step reported an error.',
+      fix: 'Open the first meaningful compiler error, fix the referenced file or configuration, and rerun the build.',
+    },
+    {
+      category: 'Network / Registry Error',
+      test: /ETIMEDOUT|ECONNRESET|ENOTFOUND|network is unreachable|connection timed out|failed to fetch.*image|toomanyrequests/i,
+      cause: 'A network connection or external package/container registry request failed.',
+      fix: 'Check network availability, registry status, image or package names, and rate limits. Retry after confirming the service is reachable.',
+    },
+  ];
+
+  const failedJob = jobs.find(
+    (job) => job.conclusion === 'failure' || job.conclusion === 'failed'
+  );
+
+  const match = patterns
+    .map((pattern) => ({
+      ...pattern,
+      evidence: allLines.find((entry) => pattern.test.test(entry.line)),
+    }))
+    .find((pattern) => pattern.evidence);
+
+  if (!match) {
+    return {
+      category: 'Unclassified Failure',
+      cause: failedJob
+        ? `The job "${failedJob.name}" failed, but no known error signature was found in the downloaded logs.`
+        : 'The workflow failed, but the available logs did not contain a recognizable error signature.',
+      fix: 'Open the failed job on GitHub, inspect its failed step and review the surrounding log lines for the first underlying error.',
+      evidence: null,
+      job: failedJob?.name || null,
+      confidence: 'Limited',
+    };
+  }
+
+  return {
+    category: match.category,
+    cause: match.cause,
+    fix: match.fix,
+    evidence: match.evidence,
+    job: failedJob?.name || null,
+    confidence: 'Pattern match',
+  };
 }
 
 function StatusBadge({ status }) {
@@ -157,6 +238,9 @@ function PipelineDetailModal({ pipeline, onClose }) {
   const [logsError, setLogsError] = useState('');
   const [search, setSearch] = useState('');
   const [viewMode, setViewMode] = useState('parsed');
+  const [analysis, setAnalysis] = useState(null);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analysisError, setAnalysisError] = useState('');
 
   useEffect(() => {
     let active = true;
@@ -197,6 +281,35 @@ function PipelineDetailModal({ pipeline, onClose }) {
       setLogsError(err.message);
     } finally {
       setLogsLoading(false);
+    }
+  };
+
+  const handleAnalyzeFailure = async () => {
+    try {
+      setAnalysisLoading(true);
+      setAnalysisError('');
+      setAnalysis(null);
+
+      // Reuse already downloaded logs; fetch only when necessary.
+      let availableLogs = logs;
+
+      if (!availableLogs.length) {
+        const result = await api.github.logs(pipeline.id);
+        availableLogs = result.files || [];
+        setLogs(availableLogs);
+        setSelectedLog(0);
+      }
+
+      if (!availableLogs.length) {
+        throw new Error('No log files are available for this workflow run.');
+      }
+
+      const report = analyzeFailure(availableLogs, jobs);
+      setAnalysis(report);
+    } catch (err) {
+      setAnalysisError(err.message || 'Could not analyze workflow logs.');
+    } finally {
+      setAnalysisLoading(false);
     }
   };
 
@@ -387,6 +500,122 @@ function PipelineDetailModal({ pipeline, onClose }) {
               </div>
             );
           })
+        )}
+
+        {/* Intelligent Failure Analysis */}
+        {pipeline.status === 'failed' && (
+          <div className="panel" style={{ marginTop: 24, padding: 16 }}>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                gap: 10,
+                flexWrap: 'wrap',
+              }}
+            >
+              <div>
+                <div className="section-kicker">INTELLIGENT FAILURE ANALYSIS</div>
+                <h3 style={{ fontSize: 14, margin: '5px 0' }}>
+                  Root Cause Detection
+                </h3>
+                <p style={{ fontSize: 10, color: '#9aa8bd', margin: 0 }}>
+                  Analyze actual GitHub Actions execution logs.
+                </p>
+              </div>
+
+              <button
+                className="button button-primary compact"
+                onClick={handleAnalyzeFailure}
+                disabled={analysisLoading}
+              >
+                <RefreshCw
+                  size={13}
+                  className={analysisLoading ? 'spin' : ''}
+                />
+                {analysisLoading
+                  ? 'Analyzing...'
+                  : analysis
+                    ? 'Analyze again'
+                    : 'Analyze failure'}
+              </button>
+            </div>
+
+            {analysisError && (
+              <div className="error-state" style={{ marginTop: 14 }}>
+                <AlertCircle size={16} />
+                <p>{analysisError}</p>
+              </div>
+            )}
+
+            {analysis && (
+              <div style={{ marginTop: 16 }}>
+                <div
+                  style={{
+                    display: 'inline-block',
+                    padding: '5px 9px',
+                    borderRadius: 6,
+                    background: '#3b1d2b',
+                    color: '#fb7185',
+                    fontSize: 10,
+                    fontWeight: 700,
+                  }}
+                >
+                  {analysis.category}
+                </div>
+
+                {analysis.job && (
+                  <div style={{ marginTop: 12, fontSize: 10, color: '#9aa8bd' }}>
+                    <strong>Failed job:</strong> {analysis.job}
+                  </div>
+                )}
+
+                <div style={{ marginTop: 14 }}>
+                  <div className="section-kicker">ROOT CAUSE</div>
+                  <p style={{ fontSize: 11, color: '#dfe5f2', lineHeight: 1.7 }}>
+                    {analysis.cause}
+                  </p>
+                </div>
+
+                <div style={{ marginTop: 14 }}>
+                  <div className="section-kicker">SUGGESTED FIX</div>
+                  <p style={{ fontSize: 11, color: '#4ade80', lineHeight: 1.7 }}>
+                    {analysis.fix}
+                  </p>
+                </div>
+
+                {analysis.evidence && (
+                  <div style={{ marginTop: 14 }}>
+                    <div className="section-kicker">MATCHED LOG EVIDENCE</div>
+                    <div
+                      style={{
+                        marginTop: 7,
+                        padding: 10,
+                        background: '#0b1220',
+                        border: '1px solid #263147',
+                        borderRadius: 6,
+                        fontFamily: 'Consolas, monospace',
+                        fontSize: 10,
+                        color: '#fb7185',
+                        overflowWrap: 'anywhere',
+                      }}
+                    >
+                      {analysis.evidence.line}
+                    </div>
+                    <p style={{ fontSize: 9, color: '#718096', marginTop: 6 }}>
+                      Source: {analysis.evidence.file}
+                    </p>
+                  </div>
+                )}
+
+                <p style={{ fontSize: 9, color: '#718096', marginTop: 12 }}>
+                  Analysis confidence: {analysis.confidence}. This is a
+                  rule-based diagnostic, not a guaranteed root-cause
+                  determination.
+                </p>
+              </div>
+            )}
+          </div>
         )}
 
         {/* Logs section */}
@@ -660,25 +889,34 @@ export default function Pipelines({ setToast }) {
   const [error, setError] = useState(null);
   const [githubConnected, setGithubConnected] = useState(false);
   const [workflowName, setWorkflowName] = useState('DeployMate CI/CD');
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const requestInFlight = useRef(false);
 
   const fetchPipelines = useCallback(async () => {
-    try {
-      setError(null);
+    // Prevent overlapping API requests
+    if (requestInFlight.current) return;
 
+    requestInFlight.current = true;
+    setRefreshing(true);
+
+    try {
       const [statusResult, runsResult] = await Promise.all([
         api.github.status(),
         api.github.runs({ per_page: 30 }),
       ]);
 
       setGithubConnected(statusResult.connected === true);
-
-      const normalizedRuns = (runsResult.runs || []).map(normalizeRun);
-      setPipelines(normalizedRuns);
+      setPipelines((runsResult.runs || []).map(normalizeRun));
+      setError(null);
+      setLastUpdated(new Date());
     } catch (err) {
+      // Keep previously loaded pipeline data on temporary API errors
       setError(err.message);
-      setGithubConnected(false);
     } finally {
       setLoading(false);
+      setRefreshing(false);
+      requestInFlight.current = false;
     }
   }, []);
 
@@ -703,13 +941,26 @@ export default function Pipelines({ setToast }) {
 
     initialize();
 
+    // Poll every 10 seconds, only while the tab is visible
     const timer = setInterval(() => {
-      fetchPipelines();
+      if (document.visibilityState === 'visible') {
+        fetchPipelines();
+      }
     }, 10000);
+
+    // Refresh immediately when the user returns to the tab
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        fetchPipelines();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       active = false;
       clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [fetchPipelines]);
 
@@ -772,15 +1023,46 @@ export default function Pipelines({ setToast }) {
               ? 'Connected to GitHub'
               : 'GitHub connection unavailable'}
           </div>
+
+          {/* Last Updated indicator */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 7,
+              marginTop: 7,
+              fontSize: 9,
+              color: '#7a8898',
+            }}
+          >
+            <span
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: '50%',
+                background: refreshing
+                  ? '#60a5fa'
+                  : lastUpdated
+                    ? '#4ade80'
+                    : '#7a8898',
+              }}
+            />
+            {refreshing
+              ? 'Updating pipeline status…'
+              : lastUpdated
+                ? `Last updated at ${lastUpdated.toLocaleTimeString()}`
+                : 'Waiting for first update…'}
+            <span>· Auto-refresh every 10 seconds</span>
+          </div>
         </div>
 
         <div className="heading-actions">
           <button
             className="button button-secondary"
             onClick={fetchPipelines}
-            disabled={loading}
+            disabled={refreshing}
           >
-            <RefreshCw size={15} className={loading ? 'spin' : ''} />
+            <RefreshCw size={15} className={refreshing ? 'spin' : ''} />
             Refresh
           </button>
         </div>
